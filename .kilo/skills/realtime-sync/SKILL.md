@@ -1,93 +1,132 @@
 ---
 name: realtime-sync
-description: Keep every World Canvas client in sync with live pixel updates using Supabase Realtime Broadcast. Covers anonymous sign-in, subscribing to the private "canvas" channel, loading the chunk snapshot without losing or double-applying pixels, reconnect and resync, and tab-visibility handling. Use this skill when working on src/realtime, live updates, "pixels not showing up for other users", stale or missing pixels after reconnecting, websocket/channel errors, or the app bootstrap order, even if the user doesn't say "realtime" or "Supabase".
-metadata:
-  project: world-canvas
-  version: "1.0"
+description: Live pixel sync for World Pixels via Supabase Realtime Broadcast - anonymous sign-in, the private "canvas" channel, snapshot plus buffered events, reconnect and resync, the place_pixel write path, start/stop under React StrictMode. Use for src/realtime, live updates, missing or stale pixels, channel errors, or "other users can't see my pixels".
 ---
 
 # Realtime sync
 
-The server is the source of truth. Pixels reach clients two ways: the **snapshot** RPC
-`get_canvas()` (chunks plus their `seq`) and the **broadcast** event `pixel` on the private topic
-`canvas`, with payload `{ x, y, c, s }`. This skill makes those two streams agree.
+Plain TS in `src/realtime/`. `startWorld()` in `src/engine.ts` calls `startSync(world, writer.onBroadcast)` and calls its `stop()` on unmount. Never import React here,
+and never call this code from a component. UI state goes out through `setState()` from `src/store.ts`.
 
-## Bootstrap sequence (follow exactly)
+Two sources must agree: the snapshot `get_canvas()` (chunks plus `seq`) and the broadcast event `pixel` on the private topic `canvas` (payload
+`{x, y, c, s}`).
 
-1. `createClient(VITE_SUPABASE_URL, VITE_SUPABASE_PUBLISHABLE_KEY)`. Create it once, in `src/supabase.ts`.
-2. If `getSession()` returns no session, call `supabase.auth.signInAnonymously()`.
-3. `await supabase.realtime.setAuth()`. Private channels need the user JWT.
-4. Subscribe and **buffer**: push every `pixel` event into an array until the snapshot is applied.
-5. When the status reaches `SUBSCRIBED`, call `supabase.rpc('get_canvas')`, decode the chunks, and keep `chunkSeq[cx,cy]`.
-6. Drain the buffer and apply each event only if `event.s > chunkSeq[chunkOf(event)]`.
-7. Switch to live mode: apply incoming events right away. They arrive in commit order.
+## Bootstrap (exact order)
 
-Subscribing **before** you load the snapshot is the whole point. If you reverse steps 4 and 5,
-any pixel placed between the two calls is lost.
+1. `getSupabase()` from `src/supabase.ts`. It creates the one client; never call `createClient` anywhere else.
+2. `getSession()`. Call `signInAnonymously()` only when there is no session: it is rate-limited per IP (~30/hour).
+3. `await supabase.realtime.setAuth()`. Private channels need the user's JWT.
+4. Subscribe and buffer every event.
+5. On `SUBSCRIBED`: load the snapshot, drain the buffer keeping only `ev.s > chunkSeq`, then go live.
+
+Subscribe **before** loading the snapshot. Otherwise pixels placed between the two calls are lost.
 
 ```ts
-const buffer: PixelEvent[] = [];
-let live = false;
+// src/realtime/sync.ts
+import type { RealtimeChannel } from '@supabase/supabase-js'
+import type { World } from '../canvas/world.ts'
+import { setState } from '../store.ts'
+import { getSupabase } from '../supabase.ts'
+import type { PixelEvent } from '../types.ts'
 
-const channel = supabase
-  .channel('canvas', { config: { private: true } })
-  .on('broadcast', { event: 'pixel' }, ({ payload }) => {
-    const ev = payload as PixelEvent;           // { x, y, c, s }
-    live ? applyPixel(ev) : buffer.push(ev);
-  })
-  .subscribe(async (status) => {
-    if (status === 'SUBSCRIBED') await resync();
-    if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT') live = false; // client auto-rejoins
-  });
+// Module-level, so StrictMode's start-stop-start in dev reuses one sign-in instead of creating two anonymous users.
+let sessionReady: Promise<boolean> | undefined
 
-async function resync() {
-  live = false;
-  const { data, error } = await supabase.rpc('get_canvas');
-  if (error) throw error;
-  const seqs = loadChunks(data);                // writes pixels, returns Map<chunkKey, seq>
-  for (const ev of buffer.splice(0)) {
-    if (ev.s > seqs.get(chunkKey(ev.x, ev.y))!) applyPixel(ev);
+function ensureSession(): Promise<boolean> {
+  sessionReady ??= (async () => {
+    const supabase = getSupabase()
+    const { data } = await supabase.auth.getSession()
+    if (!data.session) {
+      const { error } = await supabase.auth.signInAnonymously()
+      if (error) {
+        sessionReady = undefined // allow a later retry
+        return false
+      }
+    }
+    await supabase.realtime.setAuth()
+    return true
+  })()
+  return sessionReady
+}
+
+// onPixel: called after each applied event. The engine passes the pixel writer's echo handler (confirms or drops a pending optimistic paint).
+export function startSync(world: World, onPixel: (ev: PixelEvent) => void): () => void {
+  const supabase = getSupabase()
+  const buffer: PixelEvent[] = []
+  let live = false
+  let stopped = false
+  let channel: RealtimeChannel | undefined
+
+  function apply(ev: PixelEvent) {
+    world.applyPixel(ev)
+    onPixel(ev)
   }
-  live = true;
+
+  async function resync() {
+    live = false
+    const { data, error } = await supabase.rpc('get_canvas')
+    if (stopped) return
+    if (error) {
+      setState({ status: 'offline', notice: 'Could not load the canvas.' })
+      return
+    }
+    const seqs = world.loadChunks(data) // writes pixels, returns Map<chunkKey, seq>
+    for (const ev of buffer.splice(0)) {
+      if (ev.s > (seqs.get(world.chunkKey(ev.x, ev.y)) ?? 0)) apply(ev)
+    }
+    live = true
+    setState({ status: 'live', notice: null })
+  }
+
+  void ensureSession().then((ok) => {
+    if (stopped) return // unmounted while signing in
+    if (!ok) {
+      setState({ status: 'offline', notice: 'Could not sign in. Reload the page to try again.' })
+      return
+    }
+    channel = supabase
+      .channel('canvas', { config: { private: true } })
+      .on('broadcast', { event: 'pixel' }, ({ payload }) => {
+        const ev = payload as PixelEvent // { x, y, c, s }
+        if (live) apply(ev)
+        else buffer.push(ev)
+      })
+      .subscribe((status) => {
+        if (status === 'SUBSCRIBED') void resync()
+        if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT') live = false // the client rejoins by itself
+      })
+  })
+
+  return () => {
+    stopped = true
+    if (channel) void supabase.removeChannel(channel)
+  }
 }
 ```
 
 ## Rules
 
-- `resync()` runs on **every** `SUBSCRIBED`, not just the first one. Broadcast does not replay
-  messages missed while disconnected.
-- Also resync when `document.visibilityState` becomes `visible` after the tab was hidden for more than about 60 s.
-  Browsers throttle background sockets.
-- `applyPixel` must be idempotent and cheap. It writes into the pixel buffer and marks a dirty
-  rect, and the renderer draws on the next animation frame (see `pixel-canvas-rendering`). Never draw
-  synchronously inside the callback.
-- Placing a pixel means calling `supabase.rpc('place_pixel', { p_x, p_y, p_color })`. Map the error
-  message (`cooldown_active`, `out_of_bounds`, `invalid_color`, `not_authenticated`) to UI states.
-  The server also echoes your own pixel back as a broadcast, so do not apply it twice in a way that
-  breaks anything.
-- Clients **never** call `channel.send()` for pixels. RLS blocks it anyway, and only the database broadcasts.
-- If the subscribe fails because the project hit its concurrent-connection limit, show a read-only
-  "canvas is busy" banner. Load the snapshot once and poll it slowly (≥ 30 s) instead of retrying the socket in a tight loop.
+- Resync on **every** `SUBSCRIBED`, and when a tab becomes visible after more than ~60 s hidden. Broadcast does not resend missed messages by
+  default. Opt-in replay is capped at 25 messages per request, so it can't replace the snapshot.
+- `world.applyPixel` is idempotent and only writes the buffer and marks the area dirty. The renderer draws on the next frame. Never draw inside the
+  callback, and never call `setState` per pixel.
+- To write: `supabase.rpc('place_pixel', { p_x, p_y, p_color })` in `src/realtime/pixel.ts`. Map each error message to `setState({ notice })`. Your
+  own pixel comes back as a broadcast, and applying it again must be harmless.
+- Clients never `channel.send()` pixels. Only the database broadcasts.
+- If subscribing keeps failing (the 200-connection limit), `setState({ status: 'busy' })` (StatusBar shows the read-only banner) and poll the
+  snapshot every >= 30 s. No tight retry loop.
+- Every timer, listener and channel that `startSync` creates is removed by its `stop()`.
 
 ## Gotchas
 
-- When a private channel has no `select` policy on `realtime.messages`, the subscribe still reports
-  `SUBSCRIBED` but no events ever arrive. Check the policy before you debug client code.
-- If Realtime settings allow public access, a missing `private: true` on the client still
-  connects and then receives nothing from `realtime.send(..., true)`. Topic name **and** privacy must both match.
-- `payload` in the callback is the JSON object passed to `realtime.send`. Do not unwrap
-  `.record` / `.new`, because those belong to Postgres Changes, which this project does not use.
-- Supabase does not compress chunk base64. The snapshot is about 1.4 MB, so cache the decoded state and avoid
-  calling `get_canvas()` more than needed (egress quota).
-- `signInAnonymously()` is rate-limited per IP (the default is about 30 per hour). Reuse the stored session.
-  Never sign in again on every page load.
+- `SUBSCRIBED` but no events means a missing `select` policy on `realtime.messages`, or a client without `private: true`. Topic and privacy must
+  both match.
+- `payload` is the object passed to `realtime.send`. There is no `.record` / `.new`: those belong to Postgres Changes, which this project does not
+  use.
+- Events arriving twice in dev means `stop()` did not remove the channel (StrictMode mounts twice).
+- Every full snapshot is ~1.4 MB of egress. Keep the decoded state and don't refetch without a reason.
 
-## Debugging
+## Debug
 
-Fire a fake event from SQL (local or Studio) to test the client path in isolation:
-
-```sql
-select realtime.send('{"x":1,"y":1,"c":5,"s":0}'::jsonb, 'pixel', 'canvas', true);
-```
-
-`s: 0` is ignored during buffering (chunk seq ≥ 0) but applied in live mode. That is expected.
+Fake a broadcast from SQL to test the client on its own: `select realtime.send('{"x":1,"y":1,"c":5,"s":0}'::jsonb, 'pixel', 'canvas', true);` With
+`s: 0`, the event is dropped while buffering and applied when live. That is expected.

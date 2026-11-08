@@ -1,25 +1,242 @@
 {
-  "$schema": "https://app.kilo.ai/config.json",
+  // Local copy of https://app.kilo.ai/config.json, adjusted to the Kilo version that ships in the VS Code extension (see "Schema" below).
+  "$schema": "./kilo.schema.json",
+
+  // ===========================================================================
+  // World Pixels | Kilo project config for LOCAL models served by LM Studio
+  // ===========================================================================
+  // How Kilo layers config (later wins, objects deep-merge):
+  //   ~/.config/kilo/kilo.jsonc  (global: your UI prefs and base permissions)
+  //   .kilo/kilo.jsonc           (this file: model, limits, project rules)
+  // Check it:     kilo config check
+  // See result:   kilo debug config      |  kilo debug agent code
+  //
+  // THE ONE RULE FOR LOCAL MODELS: `limit.context` must match what LM Studio has actually loaded. Kilo cannot see LM Studio's settings. If you
+  // tell Kilo 262k but LM Studio loaded 64k, Kilo never compacts the chat and the prompt overflows LM Studio's window. Never edit it by hand:
+  //   node .kilo/sync-lmstudio.mjs   reads the loaded lengths from LM Studio (via `baseURL` below) and writes them into `limit.context`
+  // Kilo cannot load these values from a .env file: it rejects {env:...} in project config, and {file:...} only gives strings (tested).
+  //
+  // Schema: the published schema describes Kilo's next format (V2), which the Kilo bundled with the extension (7.8.27) only partly reads. Validating
+  // against it flags working keys, so .kilo/update-schema.mjs builds a local copy that matches 7.8.27 (tested):
+  //   provider, permission  kept: V2 `providers` / `permissions` are rejected
+  //   model                 any "<provider>/<model>", not only catalog models
+  // After a Kilo update, run: node .kilo/update-schema.mjs
+  // ===========================================================================
+
   "provider": {
+    // Custom provider ID. Model refs below use "<provider-id>/<model-id>".
     "lm-studio-custom": {
       "name": "LM Studio (host Mac)",
+      // LM Studio speaks the OpenAI Chat Completions API.
       "npm": "@ai-sdk/openai-compatible",
       "options": {
-        "baseURL": "http://192.168.1.103:1234/v1"
+        "baseURL": "http://192.168.1.103:1234/v1",
+        // LM Studio ignores the key. A dummy value stops the SDK from asking for one.
+        "apiKey": "lm-studio",
+        // Local prefill is slow. A long prompt on a 27B can take a few minutes before the first token, so the cloud-style timeouts must go:
+        "timeout": false, // no cap on total request time (long file writes)
+        "headerTimeout": 600000, // wait up to 10 min for the first byte (prefill)
+        "chunkTimeout": 300000 // abort only if the stream stalls for 5 min
       },
       "models": {
+        // ---------------------------------------------------------------------
+        // MAIN MODEL | Qwen3.8 27B | MLX | 6-bit | vision + tools + reasoning
+        // ---------------------------------------------------------------------
+        // Why this model: dense 27B, trained for tool use, has a vision tower (LM Studio reports type "vlm"), so it can read pasted screenshots.
+        //
+        // Quantization (bits per weight) for a 27B on Apple Silicon, MLX:
+        //   8-bit ≈ 30 GB  near-lossless. Only worth it with 64 GB+ RAM.
+        //   6-bit ≈ 23 GB  <- I AM HERE (22.8 GB). Sweet spot: code and tool-call JSON are close to 8-bit, and it leaves RAM for context.
+        //   4-bit ≈ 16 GB  noticeably more broken tool calls and typos on long agent runs. Use only if RAM forces it.
+        //   <4-bit         avoid for agentic coding.
+        //
+        // Context (LM Studio > model > Load > "Context Length"):
+        //   64k   minimum for agent work. Kilo's system prompt plus tools take a big slice, so compaction kicks in often.
+        //   128k  recommended if the host has the RAM (watch LM Studio's memory estimate when you move the slider).
+        //   256k  the model's max. Rarely worth the RAM, and long prompts get slow.
+        // After you change it in LM Studio, run: node .kilo/sync-lmstudio.mjs
         "qwen/qwen3.8-27b": {
-          "name": "qwen/qwen3.8-27b",
-          "reasoning": true,
+          "name": "Qwen3.8 27B | 6-bit MLX (local)",
+          "tool_call": true,
+          "reasoning": true, // streams <think> as reasoning_content; Kilo shows it
+          "temperature": true,
+          // Screenshots: enables paste/drag of images into chat (Cmd+V in VS Code).
+          "attachment": true,
+          "modalities": { "input": ["text", "image"], "output": ["text"] },
           "limit": {
-            "context": 262144,
-            "output": 8192
-          }
+            "context": 111111, // = LM Studio's loaded context length. Set by node .kilo/sync-lmstudio.mjs
+            // Max tokens per reply, and REASONING COUNTS AGAINST IT. This caused "Response reached its output limit": the old 8192 cap plus LM
+            // Studio's default xhigh thinking ran out before the file was written. Kilo compacts when the prompt reaches context - output, so a
+            // bigger cap means earlier compaction. ~16k (thinking plus a ~400-line file write) suits 64k context; ~32k suits 100k+.
+            "output": 32000
+          },
+          // Default thinking depth. LM Studio's own default for this model is "xhigh". On the same small coding prompt it used 1448 reasoning tokens
+          // vs 466 at "medium", and took 76 s vs 31 s.
+          "options": { "reasoningEffort": "medium" },
+          // Pick a variant per message in the model picker:
+          //   none   fastest. Renames, small edits, boilerplate.
+          //   low    simple features.
+          //   medium default.
+          //   high / xhigh   tricky bugs, SQL/RLS design. Slow, eats output budget.
+          "variants": {
+            "none": { "reasoningEffort": "none" },
+            "low": { "reasoningEffort": "low" },
+            "medium": { "reasoningEffort": "medium" },
+            "high": { "reasoningEffort": "high" },
+            "xhigh": { "reasoningEffort": "xhigh" }
+          },
+          "cost": { "input": 0, "output": 0 } // local = free; keeps the cost display at $0
+        },
+
+        // ---------------------------------------------------------------------
+        // Qwen3 4B Thinking 2507 | MLX | 6-bit | text only | NOT used for titles
+        // ---------------------------------------------------------------------
+        // Tested as the title model, it failed: it is thinking-only and ignores reasoning_effort. It spent its whole 2000-token budget thinking and
+        // returned an EMPTY title after 17 s. The 27B with reasoning "none" gave a good title in 0.9 s (see `agents.title` below).
+        // It stays declared so you can pick it by hand. Better still, unload it in LM Studio: that frees ~3.3 GB + KV cache, which the 27B can use
+        // for 128k context.
+        "qwen/qwen3-4b-thinking-2507": {
+          "name": "Qwen3 4B Thinking | 6-bit MLX (experiments)",
+          "tool_call": true,
+          "reasoning": true, // thinking-only model; it cannot switch reasoning off
+          "temperature": true,
+          "attachment": false,
+          "modalities": { "input": ["text"], "output": ["text"] },
+          "limit": { "context": 64256, "output": 8192 }, // context: set by node .kilo/sync-lmstudio.mjs
+          "cost": { "input": 0, "output": 0 }
         }
       }
     }
   },
+
   "model": "lm-studio-custom/qwen/qwen3.8-27b",
-  "small_model": "lm-studio-custom/qwen/qwen3.8-27b",
-  "subagent_model": "lm-studio-custom/qwen/qwen3.8-27b"
+  // No small_model on purpose. The small tasks (title, summary, compaction) are pinned in `agents` below. Anything else falls back to the main model:
+  // Kilo only looks for a flash/nano/haiku model in the same provider, and LM Studio has none. The old value pointed at an undeclared model, so it
+  // was ignored. Subagents (general, explore) inherit the session model automatically. The old "subagent_model" key is not a Kilo setting, so it did
+  // nothing.
+
+  // Background agents. "<provider>/<model>#<variant>" picks a thinking variant. Custom agents (code-writer, canvas-reviewer) live in
+  // .kilo/agents/*.md.
+  "agents": {
+    // Titles and diff summaries: short text, so no thinking (0.9 s vs 17 s+).
+    "title": { "model": "lm-studio-custom/qwen/qwen3.8-27b#none" },
+    "summary": { "model": "lm-studio-custom/qwen/qwen3.8-27b#none" },
+    // Compaction writes the summary the agent keeps working from after the window fills. Kilo runs it as a "small" call, so pin it to the 27B and
+    // keep the default medium thinking for quality.
+    "compaction": { "model": "lm-studio-custom/qwen/qwen3.8-27b" }
+  },
+
+  // ---------------------------------------------------------------------------
+  // Context budget: every token spent here is a token not spent on code.
+  // ---------------------------------------------------------------------------
+  "compaction": { "auto": true }, // summarize old turns before the window fills
+  "tool_output": {
+    // Defaults are 2000 lines / 50 KB (~13k tokens per tool result). Longer output is saved to a file the agent can page through.
+    "max_lines": 400,
+    "max_bytes": 16384
+  },
+  // Smaller screenshots cost far fewer vision tokens. 1280 px wide is plenty to judge a UI. Default is 2000 px.
+  "media": {
+    "image": { "auto_resize": true, "max_width": 1280, "max_height": 1280 }
+  },
+  // Short project-specific rules for the local model (kept small on purpose).
+  "instructions": [".kilo/instructions/local-model.md"],
+
+  // ---------------------------------------------------------------------------
+  // MCP: let the agent open the running app and screenshot it.
+  // ---------------------------------------------------------------------------
+  "mcp": {
+    "servers": {
+      "chrome-devtools": {
+        "type": "local",
+        // --slim       only 3 tools (navigate, evaluate, screenshot) instead of ~30. That saves several thousand tokens of tool definitions.
+        // --isolated   throwaway Chrome profile: none of your cookies or logins.
+        // Uses your installed Google Chrome. Version is pinned so the server does not change under you. Add "--headless=false" to watch the browser
+        // drive the canvas live.
+        "command": [
+          "npx", "-y", "chrome-devtools-mcp@1.12.0",
+          "--slim", "--isolated", "--no-usage-statistics"
+        ],
+        // Toggle off here or with /mcps. No timeout set on purpose: Kilo's defaults (30 s to connect, the MCP SDK default per tool call) fit.
+        "disabled": false
+      }
+    }
+  },
+
+  // ---------------------------------------------------------------------------
+  // Permissions: merged on top of ~/.config/kilo/kilo.jsonc.
+  // Values: "allow" | "ask" | "deny". Within a tool, the LAST matching pattern wins, so broad patterns go first and specific overrides go after them.
+  // Plan / Ask agents keep their built-in read-only rules regardless of these.
+  // ---------------------------------------------------------------------------
+  "permission": {
+    "edit": {
+      "*": "allow", // edits are snapshotted; undo/revert in the chat restores them
+      "supabase/migrations/*": "ask", // AGENTS.md: never edit an applied migration
+      "src/database.types.ts": "deny", // generated: `npx supabase gen types ...`
+      ".env*": "ask", // may hold keys
+      ".kilo/kilo.jsonc": "ask", // the agent must not rewrite its own permissions
+      "package.json": "ask", // AGENTS.md: no new or upgraded dependencies without asking
+      "AGENTS.md": "ask"
+    },
+    "bash": {
+      // ---- project workflow (AGENTS.md "Commands") ----
+      "npm run *": "allow", // every package.json script: dev, check, build, db:*, kilo:* (db:push does not exist on purpose)
+      "npm ls*": "allow",
+      "npx tsc*": "allow", // type check: `npx tsc -b` (see the vite-app skill)
+      "npx vite build*": "allow",
+      "npx supabase start*": "allow",
+      "npx supabase stop*": "allow",
+      "npx supabase status*": "allow",
+      "npx supabase db reset*": "allow", // LOCAL db only (see --linked rule below)
+      "npx supabase migration new *": "allow",
+      "npx supabase gen types typescript --local*": "allow",
+      // ---- read-only git ----
+      "git status*": "allow",
+      "git diff*": "allow",
+      "git log*": "allow",
+      "git show*": "allow",
+      // npm install, git commit/push, rm, curl, ... fall through to "*": "ask".
+
+      // ---- hosted Supabase: always ask (AGENTS.md "Never without asking") ----
+      // Listed LAST so they beat the allows above: `npx supabase db reset --linked` would wipe the HOSTED database.
+      "*--linked*": "ask",
+      "*--project-ref*": "ask",
+      "*--db-url*": "ask",
+      "npx supabase db push*": "ask",
+      "npx supabase link*": "ask",
+      // create-vite --overwrite deletes EVERYTHING in the folder, including AGENTS.md and .kilo/ (tested). The vite-app skill scaffolds safely
+      // instead.
+      "*vite*--overwrite*": "deny"
+    },
+    // Only offer this project's skills. Kilo also picks up ~/.claude/skills (docx, pptx, browser, ...). Each one adds its description to the prompt
+    // and gives a small model more ways to go wrong.
+    "skill": {
+      "*": "deny",
+      "canvas-database": "allow",
+      "realtime-sync": "allow",
+      "pixel-canvas-rendering": "allow",
+      "supabase-free-tier": "allow",
+      "vite-app": "allow",
+      "kilo-config": "allow"
+    },
+    // Browser MCP tools are named <server>_<tool>.
+    "chrome-devtools_navigate": "allow",
+    "chrome-devtools_screenshot": "allow",
+    "chrome-devtools_evaluate": "ask", // runs JS in the page
+    // Local models repeat themselves more often. Stop and ask on loops.
+    "doom_loop": "ask",
+
+    // Tools this project never uses. Kilo sends every tool definition with EVERY request. A tool denied with "*" is removed entirely. Measured prompt
+    // before you type anything: 18,025 tokens with them, 13,249 without. Delete a line to bring that tool back.
+    "cron_create": "deny", // scheduled / recurring runs
+    "cron_list": "deny",
+    "cron_delete": "deny",
+    "schedule_wakeup": "deny",
+    "cancel_wakeup": "deny",
+    "board_read": "deny", // Agent Manager shared board (parallel agents)
+    "board_post": "deny",
+    "agent_manager_models": "deny",
+    "link_pr": "deny",
+    "kilo_local_recall": "deny" // searches past sessions
+  }
 }

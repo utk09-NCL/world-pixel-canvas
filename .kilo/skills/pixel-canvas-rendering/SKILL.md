@@ -1,83 +1,63 @@
 ---
 name: pixel-canvas-rendering
-description: Render and interact with the large World Canvas in the browser using HTML canvas. Covers the pixel buffer, palette encoding, crisp pixelated scaling, pan and zoom (mouse, wheel, touch pinch), mapping a click to a pixel coordinate, hover highlight, the color picker, cooldown UI, and optimistic painting. Use this skill for anything under src/canvas or any visual or interaction bug: blurry pixels, wrong pixel clicked, slow redraws, zoom jumping, mobile touch issues, even if the user just says "the board looks off" or "make zooming nicer".
-metadata:
-  project: world-canvas
-  version: "1.0"
+description: Drawing and interacting with the World Pixels canvas in the browser - pixel buffer, palette encoding, crisp scaling, pan/zoom/pinch, click-to-pixel mapping, hover, optimistic paint. Use for anything in src/canvas and any visual or input bug (blurry pixels, wrong pixel painted, zoom jumps, slow redraws, touch issues).
 ---
 
 # Pixel canvas rendering
 
+Plain TS in `src/canvas/`, started by `startWorld()` in `src/engine.ts`. Never import React here. The palette and status bar are React components
+(see `vite-app`): this code reads the selected color with `getState().selectedColor` and never renders UI.
+
 ## Architecture
 
-- **World buffer**: one `ImageData(CANVAS_W, CANVAS_H)` plus a `Uint32Array` view `u32` over
-  its buffer. A pixel `(x, y)` lives at `u32[y * CANVAS_W + x]`.
-- **World canvas**: an offscreen canvas (`OffscreenCanvas` or a detached `<canvas>`) at 1:1 size.
-  Dirty regions are copied into it with `putImageData(imageData, 0, 0, dx, dy, dw, dh)`.
-- **View canvas**: the visible `<canvas>`, sized to its CSS box × `devicePixelRatio`. Each frame it
-  draws the world canvas through the viewport transform with `drawImage`.
-- **Viewport**: `{ scale, ox, oy }` in CSS pixels, where `screen = world * scale + offset`.
-- **Render loop**: draw only when needed. Any change sets `needsDraw = true` and a single
-  `requestAnimationFrame` flushes the dirty rect and redraws the view.
+- **World buffer**: one `ImageData(CANVAS_W, CANVAS_H)` with a `Uint32Array` view `u32`. Pixel `(x, y)` is `u32[y * CANVAS_W + x]`.
+- **World canvas**: an offscreen 1:1 canvas. Copy only dirty regions in, using `putImageData(img, 0, 0, dx, dy, dw, dh)`.
+- **View canvas**: the visible `<canvas>`, sized to its CSS box × `devicePixelRatio`.
+- **Viewport** `{ scale, ox, oy }` in CSS px: `screen = world * scale + offset`.
+- **Draw on demand**: any change sets `needsDraw`, and a single `requestAnimationFrame` flushes the dirty region and redraws. Bursts of events become one frame.
 
-## Palette encoding
-
-`PALETTE` (16 hex strings) lives in `src/config.ts`. Precompute it as Uint32 once:
+## Palette and snapshot decoding
 
 ```ts
-// ImageData is RGBA bytes; a Uint32Array over it on little-endian (all real browsers) reads ABGR.
+// ImageData is RGBA bytes; a Uint32Array over it reads ABGR on little-endian (all real browsers).
 export const PALETTE_U32 = PALETTE.map((hex) => {
-  const n = parseInt(hex.slice(1), 16);
-  return ((0xff << 24) | ((n & 0xff) << 16) | (n & 0xff00) | ((n >> 16) & 0xff)) >>> 0;
-});
-```
+  const n = parseInt(hex.slice(1), 16)
+  return ((0xff << 24) | ((n & 0xff) << 16) | (n & 0xff00) | ((n >> 16) & 0xff)) >>> 0
+})
 
-Decoding a snapshot chunk (base64 → bytes → pixels):
-
-```ts
-const bytes = Uint8Array.from(atob(row.data), (ch) => ch.charCodeAt(0));
+const bytes = Uint8Array.from(atob(row.data), (ch) => ch.charCodeAt(0))
 for (let i = 0; i < bytes.length; i++) {
-  const x = row.cx * CHUNK + (i % CHUNK);
-  const y = row.cy * CHUNK + ((i / CHUNK) | 0);
-  u32[y * CANVAS_W + x] = PALETTE_U32[bytes[i]] ?? PALETTE_U32[0];
+  const x = row.cx * CHUNK + (i % CHUNK)
+  const y = row.cy * CHUNK + ((i / CHUNK) | 0)
+  u32[y * CANVAS_W + x] = PALETTE_U32[bytes[i]] ?? PALETTE_U32[0] // unknown byte → color 0
 }
 ```
 
-## Coordinates & interaction
+## Coordinates and input
 
-- Screen to world: `x = Math.floor((clientX - rect.left - ox) / scale)`, and likewise for y. Reject
-  values outside `[0, CANVAS_W)` / `[0, CANVAS_H)`. Always use `Math.floor`. `Math.round` or `| 0`
-  are wrong for negative values and at half-pixels.
-- Zoom around the cursor: `ox = cx - (cx - ox) * (newScale / scale)` (same for y), where
-  `cx` is the cursor position relative to the canvas. Clamp `scale` between "whole canvas fits"
-  and about 40.
-- Use Pointer Events with `setPointerCapture`. A press counts as a **click** (place pixel) only when the pointer
-  moved less than 5 px. Otherwise it is a **pan**. Track two active pointers for pinch zoom.
-- Set CSS `touch-action: none` on the view canvas, or mobile browsers will scroll or zoom the page.
-- Draw the view with `ctx.setTransform(dpr * scale, 0, 0, dpr * scale, dpr * ox, dpr * oy)`, then
-  `ctx.drawImage(worldCanvas, 0, 0)`. Draw the hover outline and grid (only when `scale >= 8`) in the same pass.
+- Screen to world: `x = Math.floor((clientX - rect.left - ox) / scale)`, and the same for y. Reject anything outside the canvas. Always use `Math.floor`; `Math.round` and `| 0` are wrong at half-pixels and for negative values.
+- Zoom around the cursor: `ox = cx - (cx - ox) * (newScale / scale)`, and the same for y. Clamp the scale between "whole canvas fits" and ~40.
+- Use Pointer Events with `setPointerCapture`. Movement under 5 px is a **click** (place a pixel); more is a **pan**. Two pointers mean pinch zoom.
+- Draw with `ctx.setTransform(dpr * scale, 0, 0, dpr * scale, dpr * ox, dpr * oy)`, then `ctx.drawImage(worldCanvas, 0, 0)`. Draw the hover outline in the same pass, and the grid only when `scale >= 8`.
 
-## Placing a pixel (optimistic)
+## Optimistic paint
 
-1. If the local cooldown timer is running, show the remaining time and stop.
-2. Remember `prev = u32[i]`, write the new color, and mark it dirty. The user sees the change instantly.
-3. Call `place_pixel`. On error, put `prev` back **unless** a broadcast for that pixel arrived in the
-   meantime. Show a friendly message for `cooldown_active` and resync the timer.
-4. On success, start the cooldown timer from `COOLDOWN_MS`. The server is still the authority.
+1. If `getState().cooldownLeft > 0`, stop. The StatusBar already shows the seconds left.
+2. Save `prev = u32[i]`, write the new color, and mark the pixel dirty.
+3. Call `place_pixel`. On error, restore `prev` **unless** a broadcast for that pixel arrived in the meantime, and `setState({ notice })` with the
+   mapped message. On `cooldown_active`, restart the timer.
+4. On success, start the cooldown from `COOLDOWN_MS`. The engine's timer writes `cooldownLeft` (whole seconds) into the store only when the number
+   changes, and the timer is cleared by `stop()`. The server stays the authority.
 
 ## Gotchas
 
-- Setting `canvas.width` / `height` (on resize or DPR change) **resets the context state**. Set
-  `ctx.imageSmoothingEnabled = false` again after every resize, or pixels turn blurry.
-- Add CSS `image-rendering: pixelated` to the view canvas as a backup for any CSS-scaled path.
-- Never call `putImageData` on the view canvas. It ignores transforms. Use it only on the world canvas.
-- Do not draw from inside the realtime callback. A burst of events must turn into one frame.
-- Listen for `matchMedia(`(resolution: ${devicePixelRatio}dppx)`)` changes (moving a window to
-  another monitor) and resize the backing store.
-- A wheel listener must be `{ passive: false }` to call `preventDefault()` and stop the page from zooming.
+- Resizing a canvas resets its context. Set `ctx.imageSmoothingEnabled = false` again after every resize, and add CSS `image-rendering: pixelated`.
+- Never `putImageData` on the view canvas, because it ignores transforms.
+- The view canvas needs CSS `touch-action: none` (in `CanvasView.module.css`). Attach pointer and wheel listeners natively in `input.ts`, the wheel one
+  with `{ passive: false }`. React's `onWheel` prop is passive, so `preventDefault()` would be ignored and the page would zoom.
+- `input.ts` returns a `detach()` that removes every listener. `stop()` calls it, or StrictMode leaves a second set attached in dev.
+- Watch `matchMedia(`(resolution: ${devicePixelRatio}dppx)`)`: moving the window to another monitor changes the DPR.
 
 ## Verify
 
-Manually: zoom to maximum, then click pixel edges and corners. The highlighted pixel must match
-what gets painted. Open two browser windows and confirm a pixel shows in both. Resize the window
-and move it between monitors, and pixels must stay sharp.
+Zoom to max and click pixel edges: the highlighted pixel must be the one painted. A pixel painted in one window must show in a second window. To check visually as an agent, run `npm run dev`, open `http://localhost:5173` with the chrome-devtools tools, and take a screenshot.

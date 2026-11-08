@@ -1,53 +1,57 @@
 # World Pixels — v1 Implementation Plan
 
-A shared pixel canvas: anyone opens the page, picks a color, paints one pixel (10 s per-user
-cooldown), and sees everyone else's pixels live. Backend is Supabase free tier only
-(Postgres + Realtime Broadcast + anonymous sign-ins). No custom server, no UI framework.
+A shared pixel canvas: anyone opens the page, picks a color, paints one pixel (10 s per-user cooldown), and sees everyone else's pixels live. Backend is
+Supabase free tier only (Postgres + Realtime Broadcast + anonymous sign-ins). No custom server.
 
 ## Resolved decisions
 
-- **Persistent canvas** — 1024×1024, never resets. "First load of the day" = the normal
-  `get_canvas()` snapshot path. No daily reset in v1.
-- **Drag = pan, click = one pixel.** A pointer with < 5 px total movement between down and up
-  places a pixel; anything else pans (two pointers pinch, wheel zooms). Multi-cell drag-paint is
-  impossible by design: every cell needs its own `place_pixel` RPC and the 10 s per-user cooldown
-  is enforced server-side.
-- **No Supabase keys** → static setup banner, no crash (see edge cases).
-- Follow AGENTS.md rules and the four skills in `.kilo/skills/` (canvas-database,
-  realtime-sync, pixel-canvas-rendering, supabase-free-tier) exactly. The reference migration at
-  `.kilo/skills/canvas-database/references/schema.sql` is the starting point for the real one.
+- **Stack: React 19 + Vite 8 + TypeScript 7** (AGENTS.md "Stack"). React renders only `CanvasView`, `Palette`, `StatusBar` and `SetupBanner`. Pixels,
+  viewport, input, timers and the channel are plain TS in `src/canvas/`, `src/realtime/` and `src/engine.ts`. `src/store.ts` is the only bridge.
+- **Persistent canvas** — 1024×1024, never resets. "First load of the day" = the normal `get_canvas()` snapshot path. No daily reset in v1.
+- **Drag = pan, click = one pixel.** A pointer with < 5 px total movement between down and up places a pixel; anything else pans (two pointers pinch,
+  wheel zooms). Multi-cell drag-paint is impossible by design: every cell needs its own `place_pixel` RPC and the 10 s per-user cooldown is enforced
+  server-side.
+- **No Supabase keys** → `<SetupBanner>`, no crash (see edge cases).
+- Follow AGENTS.md and the five skills in `.kilo/skills/` exactly. Where a skill has a template (`vite-app`: store, hook, supabase client, App,
+  CanvasView, Palette; `realtime-sync`: sync.ts), copy its shape. The reference migration at `.kilo/skills/canvas-database/references/schema.sql` is
+  the starting point for the real one.
 
 ## Files to create
 
-### Root scaffolding
+### Root scaffolding — DONE (2026-11-08), do not recreate
 
-| File | What it does |
-| - | - |
-| `package.json` | Deps: `@supabase/supabase-js`. Dev: `typescript`, `vite`. Scripts: `dev`, `build`, `typecheck` (`tsc --noEmit`), `preview`. |
-| `tsconfig.json` | `strict: true`, `target` ES2022, `module`/`moduleResolution` ESNext/bundler, `lib` DOM + ES2022, `noEmit`. |
-| `vite.config.ts` | Minimal `defineConfig({})` — plain TS, no plugins. |
-| `index.html` | Mounts the app: full-viewport `<canvas>`, palette bar, status/cooldown banner element. Loads `src/main.ts`. |
-| `.gitignore` | `node_modules`, `dist`, `.env.local`. |
-| `.env.local.example` | Documents the two vars: `VITE_SUPABASE_URL`, `VITE_SUPABASE_PUBLISHABLE_KEY`. The real `.env.local` is gitignored and never committed. |
-| `README.md` (update) | How to run: `npx supabase start`, copy `.env.local.example` → `.env.local`, `npm run dev`. |
+`package.json` (scripts: AGENTS.md "Commands"), `package-lock.json`, `tsconfig.json` / `tsconfig.app.json` / `tsconfig.node.json`, `vite.config.ts`,
+`.oxlintrc.json`, `index.html`, `.gitignore`, `.env.local.example`, `public/favicon.svg`, `src/main.tsx`, `src/index.css`, `src/env.d.ts`, and a
+placeholder `src/App.tsx` (replaced in task 8). `npm run check` and `npm run build` pass.
 
 ### `src/` — frontend
 
-| File | What it does |
-| - | - |
-| `main.ts` | Bootstrap, in order: (0) check env vars → if missing render the setup banner and stop; (1) `createClient`; (2) `getSession()`, `signInAnonymously()` only when no session (reuse persisted session — anon sign-in is IP-rate-limited); (3) `realtime.setAuth()`; (4) subscribe + start buffering; (5) snapshot; (6) render; wire input/palette/UI. Owns the "canvas is busy" read-only banner too. |
-| `config.ts` | `CANVAS_W=1024`, `CANVAS_H=1024`, `CHUNK=64`, `PALETTE` (16 hex), `COOLDOWN_MS=10_000`, precomputed `PALETTE_U32` (ABGR little-endian encoding from the rendering skill). MUST mirror the SQL constants. |
-| `supabase.ts` | Single `createClient(VITE_SUPABASE_URL, VITE_SUPABASE_PUBLISHABLE_KEY)` instance. Never exports anything else; no service-role key anywhere. |
-| `database.types.ts` | Generated, never hand-edited: `npx supabase gen types typescript --local > src/database.types.ts`. |
-| `types.ts` | Shared types: `PixelEvent {x, y, c, s}`, chunk row `{cx, cy, data, seq}`, `Viewport {scale, ox, oy}`, pending-write record. |
-| `canvas/world.ts` | World buffer: `ImageData(1024,1024)` + `Uint32Array` view; `applyPixel(x, y, colorIdx)` (idempotent, marks dirty rect, never draws); base64 chunk decode into the buffer with `PALETTE_U32[b] ?? PALETTE_U32[0]` fallback; `chunkSeq: Map<key, seq>` tracking; flush dirty rects to the offscreen world canvas via `putImageData` with source rect. |
-| `canvas/viewport.ts` | `{scale, ox, oy}` in CSS px; `screenToWorld`/`worldToScreen` (always `Math.floor`, reject out-of-bounds); `zoomAtCursor` with clamp between "whole canvas fits" and ~40×; `fitToScreen()` for initial view. |
-| `canvas/renderer.ts` | Visible `<canvas>` sized to CSS box × `devicePixelRatio`; draw-on-demand loop (`needsDraw` → one `requestAnimationFrame`); `drawImage(worldCanvas, 0, 0)` under `setTransform(dpr*scale, 0, 0, dpr*scale, dpr*ox, dpr*oy)`; `imageSmoothingEnabled = false` re-set after every resize; hover outline + grid only when `scale >= 8`; listens for DPR changes (window moving between monitors). Never draws from inside realtime callbacks. |
-| `canvas/input.ts` | Pointer Events + `setPointerCapture`: press → **click** if movement < 5 px else **pan**; two active pointers → pinch zoom; wheel zoom with `{passive: false}`; CSS `touch-action: none`. Emits `place(x, y)` or pan/zoom deltas; ignores out-of-bounds coords. |
-| `canvas/palette.ts` | 16 swatches, current-color state, selection highlight; optional digit-key shortcuts. |
-| `canvas/ui.ts` | Status/cooldown banner: remaining-cooldown countdown, friendly messages for `cooldown_active` / `out_of_bounds` / `invalid_color` / `not_authenticated`, "canvas is busy" read-only banner, setup banner for missing keys. |
-| `realtime/sync.ts` | Private channel `canvas` subscription with `{config: {private: true}}`; buffers every `pixel` broadcast until the snapshot is applied; `resync()` on **every** `SUBSCRIBED` (broadcast never replays missed events) and on `visibilitychange` after the tab was hidden > ~60 s; drains the buffer applying only events with `s > chunkSeq[chunkOf(x,y)]`; flips to live mode; sets `live = false` on `CHANNEL_ERROR`/`TIMED_OUT`. Repeated subscribe failures (connection-limit) → callback that triggers the read-only banner + slow (≥ 30 s) snapshot poll, never a tight retry loop. |
-| `realtime/pixel.ts` | Write path: local cooldown gate; optimistic paint (remember `prev`, write new color, mark dirty, record pending `{x, y, prev, color}`); `supabase.rpc('place_pixel', {p_x, p_y, p_color})`; on success start the cooldown timer; on error revert `prev` **unless** a broadcast for that `(x, y)` with a newer seq arrived meanwhile, and resync the timer on `cooldown_active`. Also exposes echo reconciliation: when a broadcast lands for a pending `(x, y)`, clear the pending record (server confirmed; the apply itself is idempotent). |
+Each row names the exports other files rely on. Keep those names.
+
+| File | Exports | What it does |
+| - | - | - |
+| `config.ts` | `CANVAS_W`, `CANVAS_H`, `CHUNK`, `PALETTE`, `COOLDOWN_MS`, `PALETTE_U32` | 1024, 1024, 64, 16 hex colors (`as const`), `10_000`, and the ABGR encoding from the rendering skill. MUST mirror the SQL constants. |
+| `types.ts` | `PixelEvent`, `ChunkRow`, `Viewport` | `{x, y, c, s}`, `{cx, cy, data (base64 string), seq}`, `{scale, ox, oy}`. |
+| `database.types.ts` | `Database` | Generated by `npm run db:types` in task 2. Never hand-edit. |
+| `supabase.ts` | `missingEnv`, `getSupabase` | The `vite-app` template. The client is typed with `Database`. |
+| `store.ts` | `AppState`, `Status`, `getState`, `setState`, `subscribe` | The `vite-app` template. |
+| `hooks/useAppState.ts` | `useAppState` | The `vite-app` template. |
+| `canvas/world.ts` | `createWorld`, `World` | World buffer: `ImageData(1024,1024)` + `Uint32Array` view. `applyPixel({x, y, c})` is idempotent, marks a dirty rect and never draws. `loadChunks(rows)` decodes base64 with the `PALETTE_U32[b] ?? PALETTE_U32[0]` fallback and returns `Map<chunkKey, seq>`. `chunkKey(x, y)`. `getPixel(x, y)` / `setPixel(x, y, u32)` for optimistic paint and revert. `flush()` copies dirty rects to the offscreen world canvas with `putImageData` and a source rect. |
+| `canvas/viewport.ts` | `createViewport` | `{scale, ox, oy}` in CSS px. `screenToWorld` / `worldToScreen` (always `Math.floor`, `null` when out of bounds). `zoomAt(cx, cy, factor)`, clamped between "whole canvas fits" and ~40×. `fit(width, height)` for the first view. |
+| `canvas/renderer.ts` | `createRenderer` → `{ requestDraw, stop }` | Sizes the `<canvas>` to its CSS box × `devicePixelRatio` (`ResizeObserver`). Draw on demand: `requestDraw()` sets `needsDraw`, one `requestAnimationFrame` calls `world.flush()` then `drawImage(worldCanvas, 0, 0)` under `setTransform(dpr*scale, 0, 0, dpr*scale, dpr*ox, dpr*oy)`. `imageSmoothingEnabled = false` after every resize. Hover outline, grid only when `scale >= 8`. Watches DPR changes. `stop()` cancels the frame and disconnects the observers. |
+| `canvas/input.ts` | `attachInput` → `detach` | Native Pointer Events + `setPointerCapture` on the canvas: < 5 px movement is a click → `onPlace(x, y)` with world coords; more is a pan; two pointers pinch. Native `wheel` listener with `{ passive: false }` zooms at the cursor. Ignores out-of-bounds coords. `detach()` removes every listener. |
+| `realtime/sync.ts` | `startSync(world, onPixel)` → `stop` | The `realtime-sync` template, plus: resync on `visibilitychange` after > ~60 s hidden, and after repeated subscribe failures `setState({ status: 'busy' })` with a ≥ 30 s snapshot poll (never a tight retry loop). |
+| `realtime/pixel.ts` | `createPixelWriter(world, requestDraw)` → `{ place, onBroadcast, stop }` | `place(x, y)`: stop if `getState().cooldownLeft > 0`; optimistic paint (remember `prev`, write `PALETTE_U32[selectedColor]`, record pending `{x, y, prev}`); `place_pixel` RPC; on success start the cooldown timer, which writes `cooldownLeft` (whole seconds) to the store only when it changes; on error revert `prev` unless `onBroadcast` already confirmed that pixel, and `setState({ notice })` with the mapped message (`cooldown_active` also restarts the timer). `onBroadcast(ev)` clears the pending record for `(ev.x, ev.y)`. `stop()` clears the timer. |
+| `engine.ts` | `startWorld(canvas)` → `stop` | The only file that wires modules: world → viewport → renderer → pixel writer → input (`onPlace` → `writer.place`) → `startSync(world, writer.onBroadcast)`. Returns one `stop()` that stops them in reverse order. |
+| `components/CanvasView.tsx` + `.module.css` | `CanvasView` | The `vite-app` template. |
+| `components/Palette.tsx` + `.module.css` | `Palette` | The `vite-app` template: 16 `<button>` swatches with `aria-pressed`, in a bar fixed to the bottom edge. |
+| `components/StatusBar.tsx` + `.module.css` | `StatusBar` | Reads `status`, `notice`, `cooldownLeft` with `useAppState()`. Shows "Next pixel in 7 s", the notice text, "Connecting…", and "The canvas is busy — read-only" when `status === 'busy'`. No timers. |
+| `components/SetupBanner.tsx` + `.module.css` | `SetupBanner` | Props `{ missing: string[] }`. Lists the missing variable names, "copy `.env.local.example` to `.env.local`, then restart `npm run dev`", and "enable anonymous sign-ins in the Supabase dashboard". |
+| `App.tsx` | `App` | Replace the placeholder with the `vite-app` template. |
+
+Mapped `place_pixel` errors (StatusBar text): `cooldown_active` → "Wait for the cooldown", `out_of_bounds` → "That pixel is outside the canvas",
+`invalid_color` → "Pick a color from the palette", `not_authenticated` → "Signing in, try again in a moment". Anything else → "Could not place the
+pixel".
 
 ### `supabase/` — backend
 
@@ -103,10 +107,9 @@ cooldown), and sees everyone else's pixels live. Backend is Supabase free tier o
    reloads and reconnects take the identical path (`resync()` runs on every `SUBSCRIBED`).
    Budget: ~3.5 k full loads fit the 5 GB/month egress, so no polling — resync only on reconnect
    or after a hidden tab is resurfaced (> 60 s).
-4. **Browser with no Supabase keys.** `main.ts` checks `import.meta.env.VITE_SUPABASE_URL` and
-   `VITE_SUPABASE_PUBLISHABLE_KEY` before anything else. If either is missing it renders a static
-   setup banner (the two variable names, "put them in `.env.local`, restart the dev server", plus
-   "enable anonymous sign-ins in the Supabase dashboard") and stops: no `createClient`, no
+4. **Browser with no Supabase keys.** `App.tsx` checks `missingEnv` from `supabase.ts` (which reads `VITE_SUPABASE_URL` and
+   `VITE_SUPABASE_PUBLISHABLE_KEY`) before anything else. If either is missing it renders `<SetupBanner>` (the two variable names, "put them in `.env.local`, restart the dev server", plus
+   "enable anonymous sign-ins in the Supabase dashboard") and stops: `CanvasView` never mounts, so `getSupabase()` is never called: no client, no
    subscribe, no retry loops, no unhandled rejections.
 
 Secondary edge cases, each already covered by the design above:
@@ -137,24 +140,26 @@ topics, CAPTCHA/anti-bot beyond the cooldown, hosted `supabase db push` / `supab
 
 ## Ordered tasks
 
-1. Scaffold root files (`package.json`, `tsconfig.json`, `vite.config.ts`, `index.html`,
-   `.gitignore`, `.env.local.example`); `npm install`.
-2. `supabase/config.toml` + migration from the skill's reference schema (adapt, don't copy
-   blindly); `npx supabase start`; `npx supabase db reset` until it applies cleanly.
-3. SQL smoke tests (as authenticated and as `anon`, per the skill's Testing section).
-4. `src/config.ts`, `src/supabase.ts`, `src/types.ts`, `src/canvas/world.ts`,
-   `src/canvas/viewport.ts`, `src/canvas/renderer.ts`.
-5. `src/realtime/sync.ts` (bootstrap order + buffer + resync) and `src/realtime/pixel.ts`
-   (optimistic write + echo reconciliation + error mapping).
-6. `src/canvas/input.ts`, `src/canvas/palette.ts`, `src/canvas/ui.ts`.
-7. `src/main.ts` wiring, including the missing-keys banner.
-8. `npx supabase gen types typescript --local > src/database.types.ts`.
-9. Validation (below).
+End every task with `npm run check` passing. Hand each task to `code-writer` with the rows of the tables above that it covers.
+
+1. ~~Scaffold root files and install~~ — done.
+2. Backend: `npx supabase init`, then set `[auth] enable_anonymous_sign_ins = true` in `supabase/config.toml`. `npm run db:start`.
+   `npm run db:migration -- init_canvas` and fill it from the skill's reference schema (adapt, don't copy blindly). `npm run db:reset` until it
+   applies cleanly, then `npm run db:types`.
+3. SQL smoke tests (as authenticated and as `anon`, per the `canvas-database` skill's Test section).
+4. `src/config.ts`, `src/types.ts`, `src/supabase.ts`, `src/store.ts`, `src/hooks/useAppState.ts`.
+5. `src/canvas/world.ts`, `src/canvas/viewport.ts`, `src/canvas/renderer.ts`.
+6. `src/realtime/sync.ts`, `src/realtime/pixel.ts`.
+7. `src/canvas/input.ts`, `src/engine.ts`.
+8. `src/components/*` and `src/App.tsx`. Copy `.env.local.example` to `.env.local` and fill it from `npm run db:status`.
+9. `README.md`: prerequisites (Node, Docker), `npm install`, `npm run db:start`, `.env.local`, `npm run dev`.
+10. Validation (below), then `@canvas-reviewer`.
 
 ## Validation plan
 
-- `npx tsc --noEmit` and `npm run build` clean.
-- `npx supabase db reset` applies the migration with no errors.
+- `npm run check` and `npm run build` clean.
+- `npm run db:reset` applies the migration with no errors.
+- Dev mode (StrictMode mounts twice): each broadcast is applied once, and one browser creates one anonymous user (count rows in `auth.users`).
 - SQL smoke tests (skill): `place_pixel(10,10,3)` returns a seq; immediate second call →
   `cooldown_active`; `place_pixel(5000,0,1)` → `out_of_bounds`; `get_byte` on chunk (0,0) reads
   3; as `anon`, `place_pixel` is denied and a direct `update canvas_chunks` affects 0 rows.

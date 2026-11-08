@@ -1,0 +1,5 @@
+{
+  // Kilo inline autocomplete only runs on cloud models (Kilo Gateway, Mistral or Inception) and
+  // has no local / LM Studio option in Kilo 7.8.27. This project stays local, so it is off here. Chat and agents are unaffected.
+  "kilo-code.new.autocomplete.enableAutoTrigger": false
+}

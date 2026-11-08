@@ -1,80 +1,58 @@
 ---
 name: canvas-database
-description: Design and change the World Canvas Postgres schema on Supabase. Covers migrations, RLS policies, the canvas_chunks table, the place_pixel and get_canvas RPCs, cooldown/rate limiting, and Realtime authorization policies. Use this skill whenever a task touches SQL, supabase/migrations, tables, policies, database functions, pixel validation, cooldown rules, canvas size or palette size, even if the user only says "store pixels", "save colors", or "stop people spamming".
-metadata:
-  project: world-canvas
-  version: "1.0"
+description: World Pixels Postgres on Supabase - migrations, RLS, canvas_chunks, the place_pixel / get_canvas RPCs, cooldowns, Realtime authorization. Use for any SQL, supabase/migrations, policy or database function, and for pixel validation, canvas size, palette or cooldown changes.
 ---
 
-# Canvas database (Supabase Postgres)
+# Canvas database
 
-## Data model (do not deviate without updating AGENTS.md)
+Start from [references/schema.sql](references/schema.sql). It is tested: read it before you write the first migration or change `place_pixel`.
 
-- `public.canvas_chunks(cx smallint, cy smallint, data bytea, seq bigint)`, primary key `(cx, cy)`.
-  Each `data` value holds `CHUNK*CHUNK` bytes in row-major order, one palette index per pixel.
-  `seq` is the global sequence number of the last write to that chunk.
-- `public.placements(user_id uuid pk → auth.users, last_placed_at timestamptz)` stores cooldown state.
-- `public.pixel_seq` is a sequence that orders all writes.
-- Defaults: canvas `1024×1024`, chunk `64` (so 16×16 = 256 chunks of 4 KB each, ~1 MB total),
-  palette `16`, cooldown `10 seconds`.
+## Model
 
-The full reference migration is in [references/schema.sql](references/schema.sql). Read it
-before you write the first migration or change `place_pixel`.
+- `canvas_chunks(cx, cy, data bytea, seq)`: 16×16 chunks of 64×64 bytes (1024×1024 canvas, ~1 MB). One byte per pixel holds a palette index, row-major. `seq` is the `pixel_seq` of the chunk's last write.
+- `placements(user_id, last_placed_at)`: cooldown state, RLS on, no policies.
+- Pixel `(x, y)` lives in chunk `(x / 64, y / 64)` at byte offset `(y % 64) * 64 + (x % 64)` (0-based).
 
 ## Workflow
 
-1. Create a migration: `npx supabase migration new <snake_case_name>`. Never edit a migration
-   that may already be applied. Write a new one instead.
-2. Write idempotent-where-cheap SQL (`create or replace function`, `drop policy if exists`).
-3. Apply it locally: `npx supabase db reset`. Fix errors and repeat until it applies cleanly.
-4. Smoke-test in `psql` / Studio SQL editor (see "Testing" below).
-5. Regenerate types: `npx supabase gen types typescript --local > src/database.types.ts`.
-6. If you changed a constant (size, chunk, palette, cooldown), update `src/config.ts` too.
-7. Do **not** run `supabase db push` without the user's explicit OK.
+0. First time only: `npx supabase init` creates `supabase/config.toml`. Then `npm run db:start` (needs Docker).
+1. `npm run db:migration -- <snake_case_name>`. Never edit a migration that may be applied.
+2. `npm run db:reset` until it applies cleanly.
+3. Run the test below.
+4. `npm run db:types` regenerates `src/database.types.ts`. `npm run check` must still pass.
+5. If you changed a constant, update `src/config.ts` in the same task.
 
 ## Rules
 
-- Writes happen **only** inside `place_pixel` (`security definer`, `set search_path = ''`,
-  schema-qualified names). `canvas_chunks` gets a `select` policy and nothing else.
-  `placements` gets no policies at all.
-- `revoke execute ... from public, anon` and then `grant execute ... to authenticated`.
-  Supabase grants `anon` execute on new functions by default, so the revoke must name `anon`.
-  Anonymous-sign-in users have the `authenticated` role.
-- Validate bounds, color range, and cooldown on the server. Raise errors with stable messages
-  (`not_authenticated`, `out_of_bounds`, `invalid_color`, `cooldown_active`) because the client matches on them.
-- Lock the chunk row (`select ... for update`) **before** calling `nextval`. Otherwise two concurrent
-  writes to one chunk can commit in the opposite order to their `seq`, and clients will drop the newer pixel.
-- Broadcast from inside the same function with
-  `realtime.send(payload, 'pixel', 'canvas', true)`. The last argument `true` makes it a private channel.
-  Keep the payload tiny: `{x, y, c, s}`.
+- `place_pixel` is the only writer: `security definer`, `set search_path = ''`, schema-qualified names.
+- Error messages are an API that the client matches on: `not_authenticated`, `out_of_bounds`, `invalid_color`, `cooldown_active`.
+- `revoke execute ... from public, anon`, then `grant ... to authenticated`. Anonymous users have the `authenticated` role.
+- Lock the chunk row (`for update`) **before** `nextval`. Otherwise concurrent writes commit out of seq order and clients drop the newer pixel.
+- Broadcast from inside the same function: `realtime.send(jsonb, 'pixel', 'canvas', true)`. Keep the payload to `{x, y, c, s}`.
 
 ## Gotchas
 
-- PostgREST serializes `bytea` as hex (`\x...`), which doubles the size. `get_canvas()` must return
-  `encode(data, 'base64')` as `text`.
-- PostgREST caps rows per response (default 1000). 256 chunks fit. If you shrink chunks or grow the
-  canvas past that, page the request or raise the limit on purpose.
-- `set_byte` offsets are 0-based. The offset is `(y % CHUNK) * CHUNK + (x % CHUNK)`, and the chunk is `(x / CHUNK, y / CHUNK)`
-  (integer division).
-- In PL/pgSQL, after `insert ... on conflict do update ... where <cooldown passed>`, `FOUND` is
-  `false` when the `where` blocked the update. That is how the function detects the cooldown.
-- Do not add a per-placement history table "just in case". It grows without limit toward the 500 MB
-  free-tier database cap. If history is required, consult the `supabase-free-tier` skill first.
-- Private channels need an RLS policy on `realtime.messages`. Without a `select` policy, clients
-  subscribe successfully but **receive nothing**. Do not add an `insert` policy: that would let clients
-  forge pixel broadcasts.
-- Anonymous sign-ins must be enabled in the dashboard (Auth → Providers / Sign In settings), or
-  `signInAnonymously()` fails. Locally, set `[auth] enable_anonymous_sign_ins = true` in `supabase/config.toml`.
+- `realtime.messages` needs a `select` policy for topic `canvas`. Without it, clients subscribe fine and receive nothing. Never add an `insert` policy, because it would let clients forge pixels.
+- `get_canvas()` returns base64 text: PostgREST sends `bytea` as hex (2× size), and `encode()` wraps lines every 76 chars, so strip the newlines.
+- PostgREST returns at most 1000 rows by default. 256 chunks fit; recheck if chunks shrink.
+- After `insert ... on conflict do update ... where`, `FOUND` is false when the `where` blocked the update. That is the cooldown check.
+- No per-placement history table: it grows toward the 500 MB cap. Check `supabase-free-tier` first.
+- Local anonymous sign-in needs `[auth] enable_anonymous_sign_ins = true` in `supabase/config.toml`.
 
-## Testing
+## Test (local)
+
+Connect with `psql postgresql://postgres:postgres@127.0.0.1:54322/postgres`. `placements.user_id` references `auth.users`, so sign in anonymously once from the app and use that user's id.
 
 ```sql
--- as an authenticated user (Studio "role" selector, or set request.jwt.claims locally)
-select public.place_pixel(10, 10, 3);      -- returns seq
-select public.place_pixel(10, 10, 4);      -- second call within cooldown → ERROR cooldown_active
-select public.place_pixel(5000, 0, 1);     -- ERROR out_of_bounds
-select get_byte(data, (10 % 64) * 64 + (10 % 64)) from public.canvas_chunks where cx = 0 and cy = 0; -- 3
+set role authenticated;
+set request.jwt.claims = '{"sub":"<user-id>","role":"authenticated"}';
+select public.place_pixel(10, 10, 3);   -- returns seq
+select public.place_pixel(10, 11, 4);   -- ERROR cooldown_active (within 10 s)
+select public.place_pixel(5000, 0, 1);  -- ERROR out_of_bounds
+select get_byte(data, 10 * 64 + 10) from public.canvas_chunks where cx = 0 and cy = 0;  -- 3
+reset role;
+set role anon;
+select public.place_pixel(1, 1, 1);         -- ERROR permission denied
+update public.canvas_chunks set seq = seq;  -- UPDATE 0 (RLS)
+reset role;
 ```
-
-As the `anon` role, `place_pixel` must fail with a permission error, and a direct
-`update public.canvas_chunks ...` must affect 0 rows.
