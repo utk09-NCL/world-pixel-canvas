@@ -44,17 +44,14 @@ for (let i = 0; i < bytes.length; i++) {
 
 1. If `getState().cooldownLeft > 0`, stop. The StatusBar already shows the seconds left.
 2. Save `prev = u32[i]`, write the new color, and mark the pixel dirty.
-3. Call `place_pixel`. On error, restore `prev` **unless** a broadcast for that pixel arrived in the meantime, and `setState({ notice })` with the
-   mapped message. On `cooldown_active`, restart the timer.
-4. On success, start the cooldown from `COOLDOWN_MS`. The engine's timer writes `cooldownLeft` (whole seconds) into the store only when the number
-   changes, and the timer is cleared by `stop()`. The server stays the authority.
+3. Call `place_pixel`. On error, restore `prev` **unless** a broadcast for that pixel arrived in the meantime, and `setState({ notice })` with the mapped message. On `cooldown_active`, restart the timer.
+4. On success, start the cooldown from `COOLDOWN_MS`. The engine's timer writes `cooldownLeft` (whole seconds) into the store only when the number changes, and the timer is cleared by `stop()`. The server stays the authority.
 
 ## Gotchas
 
 - Resizing a canvas resets its context. Set `ctx.imageSmoothingEnabled = false` again after every resize, and add CSS `image-rendering: pixelated`.
 - Never `putImageData` on the view canvas, because it ignores transforms.
-- The view canvas needs CSS `touch-action: none` (in `CanvasView.module.css`). Attach pointer and wheel listeners natively in `input.ts`, the wheel one
-  with `{ passive: false }`. React's `onWheel` prop is passive, so `preventDefault()` would be ignored and the page would zoom.
+- The view canvas needs CSS `touch-action: none` (in `CanvasView.module.css`). Attach pointer and wheel listeners natively in `input.ts`, the wheel one with `{ passive: false }`. React's `onWheel` prop is passive, so `preventDefault()` would be ignored and the page would zoom.
 - `input.ts` returns a `detach()` that removes every listener. `stop()` calls it, or StrictMode leaves a second set attached in dev.
 - Watch `matchMedia(`(resolution: ${devicePixelRatio}dppx)`)`: moving the window to another monitor changes the DPR.
 

@@ -1,4 +1,5 @@
 ---
+name: canvas-reviewer
 description: Read-only review of uncommitted World Pixels changes for security (RLS, keys, definer functions), sync and rendering correctness, React rules, and free-tier cost. Use before reporting a feature as done.
 mode: subagent
 steps: 20

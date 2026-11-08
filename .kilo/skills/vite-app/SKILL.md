@@ -5,8 +5,7 @@ description: React 19 + Vite 8 + TypeScript 7 conventions for World Pixels - pro
 
 # React app (Vite 8 + React 19 + TypeScript 7)
 
-The project is scaffolded and installed. **Never run create-vite again** (its `--overwrite` deletes AGENTS.md and `.kilo/`) and never add a
-dependency without asking the user. Checked 2026-11-08: Vite 8.3, React 19.3, TypeScript 7.0, oxlint 1.x, supabase-js 2.119.
+The project is scaffolded and installed. **Never run create-vite again** (its `--overwrite` deletes AGENTS.md and `.kilo/`) and never add a dependency without asking the user. Checked 2026-11-08: Vite 8.3, React 19.3, TypeScript 7.0, oxlint 1.x, supabase-js 2.119.
 
 ## Who owns what
 
@@ -172,14 +171,10 @@ Props: a `type <Name>Props = { ... }` above the component, destructured in the s
 
 ## React 19 rules
 
-- Function components and hooks only. No class components, no `forwardRef` (`ref` is a normal prop), no `defaultProps`, no `propTypes`, no
-  `import React` (the JSX runtime is automatic: `"jsx": "react-jsx"`).
-- Not in v1, because there is no async React data: `use()`, Suspense, `lazy`, Actions, `<form action>`, `useActionState`, `useOptimistic`,
-  `useTransition`. Optimistic paint is done by the engine in plain TS, not by `useOptimistic`.
-- Effects only sync with something outside React (the engine). Every effect that starts something returns its cleanup. Don't call `setState`
-  synchronously in an effect (oxlint warns): derive the value during render instead.
-- Hooks run unconditionally at the top of the component (`rules-of-hooks`). Dependency arrays list everything used (`exhaustive-deps`). Both are
-  lint **errors**.
+- Function components and hooks only. No class components, no `forwardRef` (`ref` is a normal prop), no `defaultProps`, no `propTypes`, no `import React` (the JSX runtime is automatic: `"jsx": "react-jsx"`).
+- Not in v1, because there is no async React data: `use()`, Suspense, `lazy`, Actions, `<form action>`, `useActionState`, `useOptimistic`, `useTransition`. Optimistic paint is done by the engine in plain TS, not by `useOptimistic`.
+- Effects only sync with something outside React (the engine). Every effect that starts something returns its cleanup. Don't call `setState` synchronously in an effect (oxlint warns): derive the value during render instead.
+- Hooks run unconditionally at the top of the component (`rules-of-hooks`). Dependency arrays list everything used (`exhaustive-deps`). Both are lint **errors**.
 - Timers live in the engine. React only renders `cooldownLeft`: no `setInterval` in components.
 - List keys are stable values from the data (`hex`), never `Math.random()`.
 
@@ -193,25 +188,19 @@ Props: a `type <Name>Props = { ... }` above the component, destructured in the s
 
 ## Env variables
 
-- In `.env.local` (gitignored). `.env.local.example` lists them. Only `VITE_*` variables reach the browser, and they are **public**: never put a
-  secret or service-role key in one.
-- `src/env.d.ts` declares every variable with `strictImportMetaEnv`, so a misspelled name is a type error. A new variable goes in `env.d.ts` and in
-  `.env.local.example`.
+- In `.env.local` (gitignored). `.env.local.example` lists them. Only `VITE_*` variables reach the browser, and they are **public**: never put a secret or service-role key in one.
+- `src/env.d.ts` declares every variable with `strictImportMetaEnv`, so a misspelled name is a type error. A new variable goes in `env.d.ts` and in `.env.local.example`.
 - Vite reads env files at startup: restart `npm run dev` after changing them.
 
 ## Check, run, see
 
 - `npm run check` (`tsc -b` + oxlint) after every change. `npm run build` before calling a feature done.
-- `npm run dev` serves http://localhost:5173 and fails if the port is taken (`strictPort`). `npm run dev -- --host` also serves on the LAN, for a phone
-  on the same Wi-Fi.
-- To see a UI change: run `npm run dev` in the background, open http://localhost:5173 with the chrome-devtools tools, and take a screenshot.
+- `npm run dev` serves `http://localhost:5173` and fails if the port is taken (`strictPort`). `npm run dev -- --host` also serves on the LAN, for a phone on the same Wi-Fi.
+- To see a UI change: run `npm run dev` in the background, open `http://localhost:5173` with the chrome-devtools tools, and take a screenshot.
 
 ## Gotchas
 
 - `<StrictMode>` mounts, unmounts and remounts in dev. If `stop()` misses the channel (`supabase.removeChannel`), every event arrives twice.
-- React's `onWheel` is passive, so `preventDefault()` is ignored and the page zooms. Wheel and pointer listeners are attached natively in
-  `src/canvas/input.ts` with `{ passive: false }`.
-- `useSyncExternalStore` compares snapshots by identity: `getState()` must return the same object until `setState` runs. Never build a new object
-  inside `getState`.
-- Updating the store on every broadcast re-renders every component that uses `useAppState`. Write to the store only when a UI value changes (e.g.
-  the cooldown second, not every frame).
+- React's `onWheel` is passive, so `preventDefault()` is ignored and the page zooms. Wheel and pointer listeners are attached natively in `src/canvas/input.ts` with `{ passive: false }`.
+- `useSyncExternalStore` compares snapshots by identity: `getState()` must return the same object until `setState` runs. Never build a new object inside `getState`.
+- Updating the store on every broadcast re-renders every component that uses `useAppState`. Write to the store only when a UI value changes (e.g. the cooldown second, not every frame).

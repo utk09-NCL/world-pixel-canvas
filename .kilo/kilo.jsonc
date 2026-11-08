@@ -189,7 +189,7 @@
       "npx supabase status*": "allow",
       "npx supabase db reset*": "allow", // LOCAL db only (see --linked rule below)
       "npx supabase migration new *": "allow",
-      "npx supabase gen types typescript --local*": "allow",
+      "npx supabase gen types typescript *": "allow",
       // ---- read-only git ----
       "git status*": "allow",
       "git diff*": "allow",
